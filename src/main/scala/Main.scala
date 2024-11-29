@@ -9,28 +9,41 @@ import java.time.Duration
 import scala.util.Random
 
 @main def findSchedule(): Unit =
-
   import Planner.*
 
   val (gameNames, conflicts) = parseConflictMatrix("src/main/resources/conflict_matrix.csv")
-
-  // Random.setSeed(42)
-
   val updatedConflicts = adjustConflicts(conflicts, independentSets)
-
-  assert(updatedConflicts.getOrElse(("LoL", "Valo"), 0) == 1000)
-
   val constraints = Constraints(
     totalDuration = endHour,
-    breaks = breaks
+    breaks = breaks,
+    independentSets = independentSets
   )
 
-  val schedule = optimizedSchedule(games, updatedConflicts, constraints, 20).sorted
+  val schedules =
+    (0 until 1000).toList
+      .map(x =>
+        Random.setSeed(x)
+        (x, iterativeSchedule(games, updatedConflicts, constraints, 100).sorted)
+      ).filter((x, sched) =>
+        sched.size == games.size
+      )
+      .distinctBy(_._2)
 
-  assert(schedule.size == games.size)
+  val smallestConflict = schedules.map((x, sched) => calculateTotalConflicts(sched, updatedConflicts)).min
 
-  println("Optimized schedule conflicts: " + calculateTotalConflicts(schedule, updatedConflicts))
-  printSchedule(schedule, startTime)
+  schedules
+    .filter((x, sched) => calculateTotalConflicts(sched, updatedConflicts) == smallestConflict)
+    .foreach((x, sched) =>
+      println(f"Optimized schedule conflicts $x: " + calculateTotalConflicts(sched, updatedConflicts))
+      printSchedule(sched, startTime)
+    )
+  println("Found " + schedules.size + " distinct schedules")
+
+  // To test a single schedule :
+  // val schedule = iterativeSchedule(games, updatedConflicts, constraints, 100).sorted
+  // assert(schedule.size == games.size)
+  // println("Optimized schedule conflicts: " + calculateTotalConflicts(schedule, updatedConflicts))
+  // printSchedule(schedule, startTime)
 
 object Planner:
   import Time.*
@@ -39,7 +52,8 @@ object Planner:
 
   case class Constraints(
       totalDuration: Int,
-      breaks: List[Slot]
+      breaks: List[Slot],
+      independentSets: Set[Set[String]]
   )
 
   case class Game(name: String, duration: Int, forbiddenSlots: List[Slot] = List())
@@ -55,7 +69,12 @@ object Planner:
   case class ScheduleSlot(start: Int, game: Game) extends Ordered[ScheduleSlot]:
 
     override def compare(that: ScheduleSlot): Int =
-      (start, end, game.name).compare((that.start, that.end, game.name))
+      if this.start != that.start then
+        this.start.compareTo(that.start)
+      else if this.end != that.end then
+        this.end.compareTo(that.end)
+      else
+        this.game.name.compareTo(that.game.name)
 
     def duration = game.duration
     def end = start + game.duration
@@ -83,9 +102,8 @@ object Planner:
 
   def adjustConflicts(conflicts: ConflictMatrix, independentSets: Set[Set[String]]): ConflictMatrix =
     conflicts.map {
-      case (games @ (g1, g2), conflict) if g1 == g2                                                     => (games, 0)
-      case (games @ (g1, g2), _) if independentSets.exists(set => set.contains(g1) && set.contains(g2)) => (games, 1000)
-      case other                                                                                        => other
+      case (games @ (g1, g2), conflict) if g1 == g2 => (games, 0)
+      case other                                    => other
     }
 
   def maxTotalConflicts(conflicts: ConflictMatrix): Int =
@@ -108,7 +126,6 @@ object Planner:
       && constraints.breaks.forall(!gameSlot.overlaps(_))
       && gameSlot.game.forbiddenSlots.forall(!gameSlot.overlaps(_))
 
-  // Find the closest start time that results in a valid slot
   def closestValidSlot(gameSlot: ScheduleSlot, constraints: Constraints): Option[ScheduleSlot] =
     if isValidSlot(gameSlot, constraints) then
       Some(gameSlot)
@@ -124,15 +141,31 @@ object Planner:
       .flatMap(start => closestValidSlot(ScheduleSlot(start, game), constraints))
       .distinct
 
-  def optimizedSchedule(
+  def respectsIndependentSets(gameSlot: ScheduleSlot, schedule: List[ScheduleSlot], constraints: Constraints): Boolean =
+    schedule.forall(slot =>
+      constraints.independentSets.forall(set =>
+        slot == gameSlot || !gameSlot.overlaps(slot) || !set.contains(slot.game.name) || !set.contains(
+          gameSlot.game.name
+        )
+      )
+    )
+
+  def findBestSlot(
+      game: Game,
+      schedule: List[ScheduleSlot],
+      conflicts: ConflictMatrix,
+      constraints: Constraints
+  ): Option[ScheduleSlot] =
+    Random.shuffle(allValidGameSlots(game, constraints))
+      .filter(slot => respectsIndependentSets(slot, schedule, constraints))
+      .minByOption(slot => calculateGameConflict(ScheduleSlot(slot.start, game), schedule, conflicts))
+
+  def iterativeSchedule(
       games: List[Game],
       conflicts: ConflictMatrix,
       constraints: Constraints,
       iterations: Int = 10
   ): List[ScheduleSlot] =
-    def findBestSlot(game: Game, schedule: List[ScheduleSlot]): Option[ScheduleSlot] =
-      Random.shuffle(allValidGameSlots(game, constraints))
-        .minByOption(slot => calculateGameConflict(ScheduleSlot(slot.start, game), schedule, conflicts))
 
     def optimize(schedule: List[ScheduleSlot], iterations: Int): List[ScheduleSlot] =
       if iterations <= 0 then schedule
@@ -140,7 +173,7 @@ object Planner:
         val newSchedule =
           schedule.foldLeft(schedule)((sched, slot) =>
             val schedWithoutSlot = sched.filterNot(_ == slot)
-            findBestSlot(slot.game, schedWithoutSlot) match
+            findBestSlot(slot.game, schedWithoutSlot, conflicts, constraints) match
               case Some(newSlot) => newSlot :: schedWithoutSlot
               case _             => sched
           )
@@ -148,20 +181,34 @@ object Planner:
         optimize(
           if calculateTotalConflicts(newSchedule, conflicts) < calculateTotalConflicts(schedule, conflicts) then
             newSchedule
-          else schedule,
+          else Random.shuffle(schedule),
           iterations - 1
         )
 
-    val initialOptimizedSchedule = createBasicSchedule(games, constraints)
-    // games.foldLeft((List[ScheduleSlot]()))((schedule, game) =>
-    //   findBestSlot(game, schedule) match
-    //     case Some(slot) =>
-    //       slot :: schedule
-    //     case None =>
-    //       schedule
-    // )
+    optimize(randomSchedule(games, constraints), iterations)
 
-    optimize(initialOptimizedSchedule, iterations)
+  def onePassSchedule(
+      games: List[Game],
+      conflicts: ConflictMatrix,
+      constraints: Constraints
+  ) =
+    games.foldLeft((List[ScheduleSlot]()))((schedule, game) =>
+      findBestSlot(game, schedule, conflicts, constraints) match
+        case Some(slot) =>
+          slot :: schedule
+        case None =>
+          schedule
+    )
+
+  def randomSchedule(games: List[Game], constraints: Constraints) =
+    Random.shuffle(games).foldLeft(List.empty[ScheduleSlot]) { (schedule, game) =>
+      val validSlots = Random.shuffle(allValidGameSlots(game, constraints)).filter(slot =>
+        respectsIndependentSets(slot, schedule, constraints)
+      )
+      validSlots.headOption match
+        case Some(slot) => slot :: schedule
+        case None       => schedule
+    }
 
   def printSchedule(schedule: List[ScheduleSlot], startHour: Time): Unit =
     schedule.foreach(x =>
@@ -200,7 +247,7 @@ object Planner:
   val noDeepNight = List(Slot(Sun(2), endTime))
   val noLateAf = List(Slot(Sun(3), endTime))
   val noMorning = List(Slot(startTime, Sat(12)))
-  val noEarly = List(Slot(startTime, Sat(17)))
+  val noEarly = List(Slot(startTime, Sat(18)))
   val onlyAfternoon = List(
     Slot(startTime, Sat(12)),
     Slot(Sat(18), endTime)
@@ -217,7 +264,7 @@ object Planner:
     Game("HG_Minecraft", 2, noNight),
     Game("OSU", 1, noDeepNight),
     Game("Overcooked2", 1, noNight),
-    Game("Overwatch2", 3),
+    Game("Overwatch2", 3, List(Slot(Sun(6), endTime))),
     Game("Ping-pong", 4, noNight),
     Game("RL_3v3", 3),
     Game("Starcraft2", 5),
@@ -229,10 +276,19 @@ object Planner:
   )
 
   val independentSets = Set(
+    // Jeux switch
     Set("MK8dx", "Smash_1v1", "Smash_2v2"),
-    Set("Echecs", "Ping-pong", "LG_One_night"),
+    // Jeux hors ligne
+    Set("Echecs", "Ping-pong", "LG_One_night", "Babyfoot"),
+    // Jeux de stratégie TM pour les gens qui aiment mentir
+    Set("Among_Us", "LG_One_night"),
+    // Jeux de zinzins
     Set("LoL", "Valo"),
-    Set("Among_Us", "LG_One_night")
+    // TriviaPoly vs jeux chill
+    Set("TriviaPoly", "Balatro"),
+    Set("TriviaPoly", "LG_One_night"),
+    Set("TriviaPoly", "Geoguessr"),
+    Set("TriviaPoly", "Overcooked2")
   )
 
   val gameFancyNames = Map(
